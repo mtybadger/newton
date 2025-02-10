@@ -455,8 +455,6 @@ def try_click(scene, camera_obj, px, py, falling_cubes):
     if not hit or hit_object not in falling_cubes:
         return False
 
-    print("Hit a falling cube!")
-
     # Get the evaluated object at the current frame
     evaluated_obj = hit_object.evaluated_get(depsgraph)
     
@@ -467,9 +465,8 @@ def try_click(scene, camera_obj, px, py, falling_cubes):
     orig_rot = current_eval.matrix_world.to_euler().copy()
 
     # --- New code: Estimate velocity and rotation from previous 2 frames ---
-    if current_frame >= 3:  # Ensure there are at least 2 previous frames to sample
+    if current_frame >= 2:  # Ensure there are at least 2 previous frames to sample
         prev_frame = current_frame - 1
-        prev2_frame = current_frame - 2
 
         # Get the object's world matrix at the previous frame
         scene.frame_set(prev_frame)
@@ -477,20 +474,14 @@ def try_click(scene, camera_obj, px, py, falling_cubes):
         prev_loc = prev_eval.matrix_world.to_translation().copy()
         prev_rot = prev_eval.matrix_world.to_euler().copy()
 
-        # Get the object's world matrix two frames ago
-        scene.frame_set(prev2_frame)
-        prev2_eval = hit_object.evaluated_get(depsgraph)
-        prev2_loc = prev2_eval.matrix_world.to_translation().copy()
-        prev2_rot = prev2_eval.matrix_world.to_euler().copy()
-
         # Compute a simple linear velocity (per frame difference)
-        velocity_est = prev_loc - prev2_loc
+        velocity_est = orig_loc - prev_loc
 
         # Compute an approximate angular velocity from the Euler angles
         angular_velocity_est = mathutils.Euler((
-            prev_rot.x - prev2_rot.x,
-            prev_rot.y - prev2_rot.y,
-            prev_rot.z - prev2_rot.z
+            orig_rot.x - prev_rot.x,
+            orig_rot.y - prev_rot.y,
+            orig_rot.z - prev_rot.z
         ))
         # Restore the current frame
         scene.frame_set(current_frame)
@@ -499,9 +490,6 @@ def try_click(scene, camera_obj, px, py, falling_cubes):
         angular_velocity_est = mathutils.Euler((0.0, 0.0, 0.0))
         scene.frame_set(current_frame)
     # --- End new code ---
-
-    print(f"Orig loc: {orig_loc}")
-    print(f"Orig rot: {orig_rot}")
 
     # Calculate impulse direction (existing behavior)
     to_center = (orig_loc - hit_location).normalized()
@@ -523,8 +511,6 @@ def try_click(scene, camera_obj, px, py, falling_cubes):
         orig_rot.z + torque_axis.z * torque_amount + angular_velocity_est.z
     ))
 
-    print(f"New loc: {new_loc}")
-    print(f"New rot: {new_rot}")
     
     previous_frame = current_frame - 1
     next_frame = current_frame + 1
@@ -586,6 +572,14 @@ def render_animation(video_index, falling_cubes):
     # Prepare a log array with 4 columns per frame:
     # [rotLeft, rotRight, clickX, clickY]
     log_data = [[0, 0, 0, 0] for _ in range(FRAMES_PER_VIDEO)]
+    
+    # -------------------------------------------------------------------------
+    # NEW: Prepare a log for falling cubes transforms.
+    # Each line will be:
+    # frame, r_pos(x,y,z), r_rot(x,y,z), g_pos, g_rot, b_pos, b_rot
+    # (if a cube isn't present, its 6 values are zeros)
+    transforms_lines = []
+    # -------------------------------------------------------------------------
 
     # Keep track of camera rotation end to avoid overlapping animations
     camera_animation_end = 0
@@ -610,24 +604,24 @@ def render_animation(video_index, falling_cubes):
         # Advance physics
         scene.frame_set(frame)
 
-        # Do two clicks per frame
+        # Do a clicks per frame
         hits = []
         misses = []
-        for _ in range(2):
-            px = random.randint(0, 255)
-            py = random.randint(0, 255)
-            hit_cube = try_click(scene, camera_obj, px, py, falling_cubes)
-            if hit_cube:
-                hits.append((px, py))
-            else:
-                misses.append((px, py))
+        
+        px = random.randint(0, 255)
+        py = random.randint(0, 255)
+        hit_cube = try_click(scene, camera_obj, px, py, falling_cubes)
+        if hit_cube:
+            hits.append((px, py))
+        else:
+            misses.append((px, py))
 
         # Log one click with priority to hits
         if hits and random.random() < 1.0:  # Always log a hit if we have one
             px, py = random.choice(hits)
             log_data[frame - 1][2] = px
             log_data[frame - 1][3] = py
-        elif misses and random.random() < 0.2:  # 20% chance to log a miss if no hits
+        elif misses and random.random() < 0.1:  # 20% chance to log a miss if no hits
             px, py = random.choice(misses)
             log_data[frame - 1][2] = px
             log_data[frame - 1][3] = py
@@ -637,13 +631,45 @@ def render_animation(video_index, falling_cubes):
         with stdout_redirected():
             bpy.ops.render.render(write_still=True)
 
-    # Write the log file
+        # ---------------------------------------------------------------------
+        # NEW: Log transforms for falling cubes (red, then green, then blue)
+        current_transforms = []
+        # Always log in order: red, green, blue.
+        for color in ["RED", "GREEN", "BLUE"]:
+            cube_found = None
+            for cube in falling_cubes:
+                # Identify the cube by checking if its first material name contains the color label.
+                if cube.data.materials and f"CubeColor_{color}" in cube.data.materials[0].name:
+                    cube_found = cube
+                    break
+            if cube_found:
+                # Use the object's world matrix to extract location and Euler rotation.
+                loc = cube_found.matrix_world.to_translation()
+                rot = cube_found.matrix_world.to_euler()
+                current_transforms.extend([loc.x, loc.y, loc.z, rot.x, rot.y, rot.z])
+            else:
+                # Cube not present; fill in zeros.
+                current_transforms.extend([0, 0, 0, 0, 0, 0])
+        # Optionally include the frame number as the first field.
+        line = f"{frame}," + ",".join(str(val) for val in current_transforms)
+        transforms_lines.append(line)
+        # ---------------------------------------------------------------------
+
+    # Write the click log file (existing behavior)
     log_filename = f"video_{(video_index - 1):03d}.txt"
     log_path = os.path.join(output_path, log_filename)
     with open(log_path, 'w') as f:
         for row in log_data:
             # row is [rotLeft, rotRight, clickX, clickY]
             f.write(f"[{row[0]},{row[1]},{row[2]},{row[3]}]\n")
+    
+    # -------------------------------------------------------------------------
+    # NEW: Write the transforms log file.
+    transforms_filepath = os.path.join(output_path, "transforms.txt")
+    with open(transforms_filepath, 'w') as f:
+        for line in transforms_lines:
+            f.write(line + "\n")
+    # -------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
 # Main generation loop

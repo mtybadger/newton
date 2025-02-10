@@ -4,10 +4,43 @@ import math
 import os
 import mathutils
 
+import os
+import sys
+from contextlib import contextmanager
+from tqdm import tqdm
+@contextmanager
+def stdout_redirected(to=os.devnull):
+    '''
+    import os
+
+    with stdout_redirected(to=filename):
+        print("from Python")
+        os.system("echo non-Python applications are also supported")
+    '''
+    fd = sys.stdout.fileno()
+
+    ##### assert that Python and C stdio write using the same file descriptor
+    ####assert libc.fileno(ctypes.c_void_p.in_dll(libc, "stdout")) == fd == 1
+
+    def _redirect_stdout(to):
+        sys.stdout.close() # + implicit flush()
+        os.dup2(to.fileno(), fd) # fd writes to 'to' file
+        sys.stdout = os.fdopen(fd, 'w') # Python writes to fd
+
+    with os.fdopen(os.dup(fd), 'w') as old_stdout:
+        with open(to, 'w') as file:
+            _redirect_stdout(to=file)
+        try:
+            yield # allow code to be run with the redirected stdout
+        finally:
+            _redirect_stdout(to=old_stdout) # restore stdout.
+                                            # buffering and flags such as
+                                            # CLOEXEC may be different
+
 # -----------------------------------------------------------------------------
 # User-configurable parameters
 # -----------------------------------------------------------------------------
-NUM_VIDEOS = 10000             # How many videos to generate
+NUM_VIDEOS = 5             # How many videos to generate
 FPS = 24                       # Frames per second
 VIDEO_SECONDS = 15             # Duration of each video (seconds)
 FRAMES_PER_VIDEO = FPS * VIDEO_SECONDS
@@ -33,9 +66,8 @@ CAMERA_ANIMATION_FRAMES = 15
 CAMERA_ANIMATION_ANGLE = math.radians(90.0)
 
 # Click parameters
-CLICKS_PER_VIDEO = 10000
 MISS_LOG_PERCENT = 0.1  # 10% of misses get logged
-EXPLOSIVE_FORCE = 50.0   # Increased from 5.0 to 50.0 for more visible effect
+EXPLOSIVE_FORCE = 0.25   # Increased from 5.0 to 50.0 for more visible effect
 
 # Ensure output folder exists
 if not os.path.exists(OUTPUT_FOLDER):
@@ -176,6 +208,7 @@ def create_random_terrain():
     bpy.ops.rigidbody.object_add()
     base_cube.rigid_body.type = 'PASSIVE'
     base_cube.rigid_body.collision_shape = 'BOX'
+    base_cube.rigid_body.friction = 1.0
     terrain_objects.append(base_cube)
 
     # Scatter random boxes
@@ -204,6 +237,7 @@ def create_random_terrain():
         bpy.ops.rigidbody.object_add()
         cube.rigid_body.type = 'PASSIVE'
         cube.rigid_body.collision_shape = 'BOX'
+        cube.rigid_body.friction = 1.0
 
         terrain_objects.append(cube)
 
@@ -321,6 +355,7 @@ def create_falling_cubes(terrain_objects):
         cube.rigid_body.type = 'ACTIVE'
         cube.rigid_body.collision_shape = 'BOX'
         cube.rigid_body.mass = 1.0
+        cube.rigid_body.friction = 1.0
 
         falling_cubes.append(cube)
 
@@ -413,54 +448,113 @@ def try_click(scene, camera_obj, px, py, falling_cubes):
     # Build the ray
     origin, direction = build_camera_ray(scene, camera_obj, px, py)
 
-    print(f"Origin: {origin}, Direction: {direction}")
-
-    # Do the raycast
-    result = scene.ray_cast(
-        bpy.context.view_layer, 
-        origin, 
-        direction, 
-        distance=9999.0
-    )
-
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    result = scene.ray_cast(depsgraph, origin, direction, distance=9999.0)
     hit, hit_location, hit_normal, face_index, hit_object, matrix = result
-    if not hit:
+
+    if not hit or hit_object not in falling_cubes:
         return False
+
+    print("Hit a falling cube!")
+
+    # Get the evaluated object at the current frame
+    evaluated_obj = hit_object.evaluated_get(depsgraph)
     
-    print(f"Hit: {hit}, Location: {hit_location}, Normal: {hit_normal}, Face Index: {face_index}, Object: {hit_object}, Matrix: {matrix}")
+    # Store the current frame and current object's state
+    current_frame = scene.frame_current
+    current_eval = hit_object.evaluated_get(depsgraph)
+    orig_loc = current_eval.matrix_world.to_translation().copy()
+    orig_rot = current_eval.matrix_world.to_euler().copy()
 
-    # Check if the object is one of the falling cubes
-    if hit_object in falling_cubes:
-        print("Hit a falling cube!")
-        # Apply explosive force: from hit_location to object center
-        obj_center = hit_object.location
-        to_center = (obj_center - hit_location).normalized()
-        
-        # Add some upward bias to the force
-        to_center.z += 0.5  # Add upward component
-        to_center.normalize()  # Renormalize after adding upward bias
-        
-        # Add random variation to make it more dynamic
-        random_variation = mathutils.Vector((
-            random.uniform(-0.2, 0.2),
-            random.uniform(-0.2, 0.2),
-            random.uniform(0, 0.2)
-        ))
-        
-        # Apply force with variation
-        force_dir = (to_center + random_variation).normalized()
-        hit_object.rigid_body.linear_velocity += force_dir * EXPLOSIVE_FORCE
-        
-        # Also add some angular velocity for spin
-        hit_object.rigid_body.angular_velocity = mathutils.Vector((
-            random.uniform(-5, 5),
-            random.uniform(-5, 5),
-            random.uniform(-5, 5)
-        ))
-        
-        return True
+    # --- New code: Estimate velocity and rotation from previous 2 frames ---
+    if current_frame >= 3:  # Ensure there are at least 2 previous frames to sample
+        prev_frame = current_frame - 1
+        prev2_frame = current_frame - 2
 
-    return False
+        # Get the object's world matrix at the previous frame
+        scene.frame_set(prev_frame)
+        prev_eval = hit_object.evaluated_get(depsgraph)
+        prev_loc = prev_eval.matrix_world.to_translation().copy()
+        prev_rot = prev_eval.matrix_world.to_euler().copy()
+
+        # Get the object's world matrix two frames ago
+        scene.frame_set(prev2_frame)
+        prev2_eval = hit_object.evaluated_get(depsgraph)
+        prev2_loc = prev2_eval.matrix_world.to_translation().copy()
+        prev2_rot = prev2_eval.matrix_world.to_euler().copy()
+
+        # Compute a simple linear velocity (per frame difference)
+        velocity_est = prev_loc - prev2_loc
+
+        # Compute an approximate angular velocity from the Euler angles
+        angular_velocity_est = mathutils.Euler((
+            prev_rot.x - prev2_rot.x,
+            prev_rot.y - prev2_rot.y,
+            prev_rot.z - prev2_rot.z
+        ))
+        # Restore the current frame
+        scene.frame_set(current_frame)
+    else:
+        velocity_est = mathutils.Vector((0.0, 0.0, 0.0))
+        angular_velocity_est = mathutils.Euler((0.0, 0.0, 0.0))
+        scene.frame_set(current_frame)
+    # --- End new code ---
+
+    print(f"Orig loc: {orig_loc}")
+    print(f"Orig rot: {orig_rot}")
+
+    # Calculate impulse direction (existing behavior)
+    to_center = (orig_loc - hit_location).normalized()
+    up_vector = mathutils.Vector((0, 0, 0.5))
+    impulse_dir = (to_center + up_vector).normalized()
+
+    impulse_strength = EXPLOSIVE_FORCE
+
+    # Existing impulse offset plus additional velocity estimate
+    pop_offset = impulse_dir * impulse_strength
+    new_loc = orig_loc + pop_offset + velocity_est
+
+    lever_arm = hit_location - orig_loc
+    torque_axis = lever_arm.cross(impulse_dir).normalized()
+    torque_amount = impulse_strength * 0.5
+    new_rot = mathutils.Euler((
+        orig_rot.x + torque_axis.x * torque_amount + angular_velocity_est.x,
+        orig_rot.y + torque_axis.y * torque_amount + angular_velocity_est.y,
+        orig_rot.z + torque_axis.z * torque_amount + angular_velocity_est.z
+    ))
+
+    print(f"New loc: {new_loc}")
+    print(f"New rot: {new_rot}")
+    
+    previous_frame = current_frame - 1
+    next_frame = current_frame + 1
+    scene.frame_set(previous_frame)
+
+    # Make object non-kinematic for the previous frame and keyframe it
+    evaluated_obj.rigid_body.kinematic = False
+    evaluated_obj.keyframe_insert(data_path="rigid_body.kinematic", frame=previous_frame)
+    
+    scene.frame_set(current_frame)
+    evaluated_obj.rigid_body.kinematic = True
+    evaluated_obj.keyframe_insert(data_path="rigid_body.kinematic", frame=current_frame)
+    evaluated_obj.matrix_world.translation = orig_loc
+    evaluated_obj.rotation_euler = orig_rot
+    evaluated_obj.keyframe_insert(data_path="location", frame=current_frame)
+    evaluated_obj.keyframe_insert(data_path="rotation_euler", frame=current_frame)
+
+    scene.frame_set(next_frame)
+    evaluated_obj.matrix_world.translation = new_loc
+    evaluated_obj.rotation_euler = new_rot
+    evaluated_obj.keyframe_insert(data_path="location", frame=next_frame)
+    evaluated_obj.keyframe_insert(data_path="rotation_euler", frame=next_frame)
+    
+    scene.frame_set(next_frame + 1)
+    evaluated_obj.rigid_body.kinematic = False
+    evaluated_obj.keyframe_insert(data_path="rigid_body.kinematic", frame=next_frame + 1)
+
+    # Restore current frame so continued rendering works as expected
+    scene.frame_set(current_frame)
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -493,19 +587,12 @@ def render_animation(video_index, falling_cubes):
     # [rotLeft, rotRight, clickX, clickY]
     log_data = [[0, 0, 0, 0] for _ in range(FRAMES_PER_VIDEO)]
 
-    # Decide in advance which frames will get a click (exactly 100).
-    # We allow duplicates if random.sample < frames. If you want guaranteed unique frames:
-    # frames_for_click = random.sample(range(1, FRAMES_PER_VIDEO+1), k=CLICKS_PER_VIDEO)
-    # If duplicates are okay:
-    frames_for_click = [i for i in range(1, FRAMES_PER_VIDEO+1)]
-
     # Keep track of camera rotation end to avoid overlapping animations
     camera_animation_end = 0
 
     # Step through each frame
-    for frame in range(scene.frame_start, scene.frame_end + 1):
-
-        print(f"Frame: {frame}")
+    for frame in tqdm(range(scene.frame_start, scene.frame_end + 1)):
+        
         # Possibly trigger a new rotation if:
         #   (a) we're past the current animation
         #   (b) there's enough frames left
@@ -523,34 +610,34 @@ def render_animation(video_index, falling_cubes):
         # Advance physics
         scene.frame_set(frame)
 
-        # Check if this frame is in frames_for_click
-        if frame in frames_for_click:
-
-            print(f"Clicking at frame {frame}")
-            # Do one click
+        # Do two clicks per frame
+        hits = []
+        misses = []
+        for _ in range(2):
             px = random.randint(0, 255)
             py = random.randint(0, 255)
             hit_cube = try_click(scene, camera_obj, px, py, falling_cubes)
             if hit_cube:
-                # Log it: put px in [2], py in [3]
-                log_data[frame - 1][2] = px
-                log_data[frame - 1][3] = py
+                hits.append((px, py))
             else:
-                # We missed. Only 10% chance we explicitly show a (0,0) click
-                if random.random() < MISS_LOG_PERCENT:
-                    log_data[frame - 1][2] = px
-                    log_data[frame - 1][3] = py
-                    # Technically it is the same as "no click," 
-                    # but we set it to [2]=0,[3]=0 anyway
-                    # (they are already 0, so effectively no change).
-                    pass
+                misses.append((px, py))
+
+        # Log one click with priority to hits
+        if hits and random.random() < 1.0:  # Always log a hit if we have one
+            px, py = random.choice(hits)
+            log_data[frame - 1][2] = px
+            log_data[frame - 1][3] = py
+        elif misses and random.random() < 0.2:  # 20% chance to log a miss if no hits
+            px, py = random.choice(misses)
+            log_data[frame - 1][2] = px
+            log_data[frame - 1][3] = py
 
         # Render
         scene.render.filepath = os.path.join(output_path, f"frame_{frame:04d}.jpg")
-        bpy.ops.render.render(write_still=True)
+        with stdout_redirected():
+            bpy.ops.render.render(write_still=True)
 
     # Write the log file
-    # E.g. "video_000.txt" for video_index=1
     log_filename = f"video_{(video_index - 1):03d}.txt"
     log_path = os.path.join(output_path, log_filename)
     with open(log_path, 'w') as f:

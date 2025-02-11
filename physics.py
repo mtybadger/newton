@@ -7,7 +7,6 @@ import mathutils
 import os
 import sys
 from contextlib import contextmanager
-from tqdm import tqdm
 @contextmanager
 def stdout_redirected(to=os.devnull):
     '''
@@ -40,7 +39,7 @@ def stdout_redirected(to=os.devnull):
 # -----------------------------------------------------------------------------
 # User-configurable parameters
 # -----------------------------------------------------------------------------
-NUM_VIDEOS = 5             # How many videos to generate
+NUM_VIDEOS = 500             # How many videos to generate
 FPS = 24                       # Frames per second
 VIDEO_SECONDS = 15             # Duration of each video (seconds)
 FRAMES_PER_VIDEO = FPS * VIDEO_SECONDS
@@ -585,7 +584,7 @@ def render_animation(video_index, falling_cubes):
     camera_animation_end = 0
 
     # Step through each frame
-    for frame in tqdm(range(scene.frame_start, scene.frame_end + 1)):
+    for frame in range(scene.frame_start, scene.frame_end + 1):
         
         # Possibly trigger a new rotation if:
         #   (a) we're past the current animation
@@ -675,8 +674,20 @@ def render_animation(video_index, falling_cubes):
 # Main generation loop
 # -----------------------------------------------------------------------------
 def main():
-    for i in range(1, NUM_VIDEOS + 1):
-        print(f"--- Generating video {i}/{NUM_VIDEOS} ---")
+    # Get starting index from command line argument, default to 0
+    if len(sys.argv) > 1:
+        try:
+            start_index = int(sys.argv[-1]) * 500 + 1
+        except ValueError:
+            print("Error: Argument must be an integer (0 for 0-99, 1 for 100-199, etc)")
+            sys.exit(1)
+    else:
+        start_index = 1
+
+    end_index = start_index + 499  # Generate 100 videos from the starting point
+
+    for i in range(start_index, end_index + 1):
+        print(f"--- Generating video {i}/{end_index} ---")
         clear_scene()
 
         setup_scene()
@@ -690,7 +701,7 @@ def main():
         # Render & log
         render_animation(i, falling_cubes)
 
-        print(f"--- Finished video {i}/{NUM_VIDEOS} ---")
+        print(f"--- Finished video {i}/{end_index} ---")
 
 
 # -----------------------------------------------------------------------------

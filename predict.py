@@ -292,90 +292,205 @@ color_bgr = {
 }
 
 # -----------------------
-# Process Each Color
+# New Functionality: Cube Pose Estimation and Comparison
 # -----------------------
 colors = ["green", "red", "blue"]
-final_img = img.copy()
 
-for color in colors:
-    print("\nProcessing", color, "cube...")
-    
-    # Get the color mask and features.
-    mask, edges_img, dt, corners = get_color_features(img_for_mask, color)
-    
-    # If the mask is empty, skip this color.
-    if mask is None or cv2.countNonZero(mask) == 0 or dt is None:
-        print(f"No {color} mask found. Skipping {color} cube optimization.")
-        continue
-    
-    # -----------------------
-    # Find Initial Parameters for This Color
-    # -----------------------
-    found_initial = False
-    attempt = 0
-    init_params = None
-    while not found_initial and attempt < 10000:
-        attempt += 1
-        init_params = np.array([
-            np.random.uniform(-10, 10),       # x
-            np.random.uniform(0, 8),          # y
-            np.random.uniform(-10, 10),       # z
-            np.random.uniform(-np.pi, np.pi), # rx
-            np.random.uniform(-np.pi, np.pi), # ry
-            np.random.uniform(-np.pi, np.pi)  # rz
-        ])
-        obj_val = objective_function(init_params, mask, dt, corners)
+def estimate_cube_poses(image):
+    """
+    Estimate optimized cube poses for each color in the provided image.
+    Returns a dictionary mapping color names to optimized pose parameter arrays.
+    """
+    poses = {}
+    # Use a copy of the image for analysis
+    img_for_analysis = image.copy()
+    for color in colors:
+        print("\nProcessing", color, "cube...")
+        mask, edges_img, dt, corners = get_color_features(img_for_analysis, color)
         
-        print(f"Attempt {attempt}: obj = {obj_val:.2f}")
-        if obj_val < 30:
-            found_initial = True
-            print(f"Found initial parameters for {color} cube on attempt {attempt} with objective {obj_val:.2f}:")
-            print(init_params)
-    
-    if not found_initial:
-        print(f"Could not find an initial pose for the {color} cube with sufficient overlap. Skipping.")
-        continue
-    
-    # -----------------------
-    # Optimize the Pose for This Color
-    # -----------------------
-    bounds = [
-        (-10, 10),    # x
-        (0, 10),      # y
-        (-10, 10),    # z
-        (-np.pi, np.pi),  # rx
-        (-np.pi, np.pi),  # ry
-        (-np.pi, np.pi)   # rz
-    ]
-    
-    result = differential_evolution(
-        objective_function,
-        bounds,
-        args=(mask, dt, corners),
-        strategy='best1bin',
-        maxiter=3000,
-        popsize=50,
-        mutation=(0.5, 1.0),
-        recombination=0.7,
-        tol=1e-5,
-        atol=1e-5,
-        disp=True,
-        workers=-1  # Use all available CPU cores
-    )
+        if mask is None or cv2.countNonZero(mask) == 0 or dt is None:
+            print(f"No {color} mask found. Skipping {color} cube optimization.")
+            continue
+        
+        # Find initial parameters for this color
+        found_initial = False
+        attempt = 0
+        init_params = None
+        while not found_initial and attempt < 10000:
+            attempt += 1
+            init_params = np.array([
+                np.random.uniform(-10, 10),       # x
+                np.random.uniform(0, 8),          # y
+                np.random.uniform(-10, 10),       # z
+                np.random.uniform(-np.pi, np.pi), # rx
+                np.random.uniform(-np.pi, np.pi), # ry
+                np.random.uniform(-np.pi, np.pi)  # rz
+            ])
+            obj_val = objective_function(init_params, mask, dt, corners)
+            print(f"Attempt {attempt}: obj = {obj_val:.2f}")
+            if obj_val < 30:
+                found_initial = True
+                print(f"Found initial parameters for {color} cube on attempt {attempt} with objective {obj_val:.2f}:")
+                print(init_params)
+        
+        if not found_initial:
+            print(f"Could not find an initial pose for the {color} cube with sufficient overlap. Skipping.")
+            continue
+        
+        # Optimize the pose for this color
+        bounds = [
+            (-10, 10),    # x
+            (0, 10),      # y
+            (-10, 10),    # z
+            (-np.pi, np.pi),  # rx
+            (-np.pi, np.pi),  # ry
+            (-np.pi, np.pi)   # rz
+        ]
+        
+        result = differential_evolution(
+            objective_function,
+            bounds,
+            args=(mask, dt, corners),
+            strategy='best1bin',
+            maxiter=3000,
+            popsize=50,
+            mutation=(0.5, 1.0),
+            recombination=0.7,
+            tol=1e-5,
+            atol=1e-5,
+            disp=False,
+            workers=-1  # Use all available CPU cores
+        )
+        
+        optimized_params = result.x
+        best_loss = result.fun
+        print(f"Optimized parameters for {color} cube:", optimized_params)
+        print(f"Final loss for {color} cube: {best_loss:.2f}")
+        
+        poses[color] = optimized_params
+        
+    return poses
 
-    optimized_params = result.x
-    best_loss = result.fun
-    print(f"\nOptimized parameters for {color} cube:", optimized_params)
-    print(f"Final loss for {color} cube: {best_loss:.2f}")
+def compare_cube_poses(image1, image2):
+    """
+    Compare cube poses between two images.
+    Estimates cube poses for each image and computes the difference for each color.
+    Returns a dictionary mapping each color to a difference metric, which includes:
+      - difference_vector: The element-wise difference between the pose parameters.
+      - difference_norm: The Euclidean norm of the difference vector.
+    If a cube pose is not found in one of the images, returns None for that color.
+    """
+    poses1 = estimate_cube_poses(image1)
+    poses2 = estimate_cube_poses(image2)
+    # Normalize differences based on parameter bounds
+    bounds = np.array([
+        20.0,     # x: [-10,10] range = 20
+        10.0,     # y: [0,10] range = 10  
+        20.0,     # z: [-10,10] range = 20
+        2*np.pi,  # rx: [-pi,pi] range = 2pi
+        2*np.pi,  # ry: [-pi,pi] range = 2pi
+        2*np.pi   # rz: [-pi,pi] range = 2pi
+    ])
     
-    # Draw the optimized cube on the final image
-    optimized_projection = project_cube(optimized_params)
-    for start, end in edges:
-        pt1 = tuple(map(int, optimized_projection[start]))
-        pt2 = tuple(map(int, optimized_projection[end]))
-        cv2.line(final_img, pt1, pt2, color_bgr[color], 2)
+    total_diff = 0
+    found_cubes = 0
+    
+    for color in colors:
+        if color in poses1 and color in poses2:
+            # Get normalized difference for each parameter
+            diff_vector = (poses1[color] - poses2[color]) / bounds
+            diff_norm = np.linalg.norm(diff_vector)
+            total_diff += diff_norm
+            found_cubes += 1
+            
+    # Return average normalized difference scaled to 0-20 range
+    # If no cubes found, return max score of 20
+    if found_cubes == 0:
+        return 60.0
+    else:
+        return min(60.0, (total_diff / found_cubes) * 60.0)
 
-# Show final image with all cubes
-cv2.imshow("Final Cube Fits", final_img)
-cv2.waitKey(0)
-cv2.destroyAllWindows()
+# -----------------------
+# Process Each Color (Main Execution)
+# -----------------------
+if __name__ == "__main__":
+    final_img = img.copy()
+
+    for color in colors:
+        print("\nProcessing", color, "cube...")
+        
+        # Get the color mask and features.
+        mask, edges_img, dt, corners = get_color_features(img_for_mask, color)
+        
+        # If the mask is empty, skip this color.
+        if mask is None or cv2.countNonZero(mask) == 0 or dt is None:
+            print(f"No {color} mask found. Skipping {color} cube optimization.")
+            continue
+        
+        # Find initial parameters for this color
+        found_initial = False
+        attempt = 0
+        init_params = None
+        while not found_initial and attempt < 10000:
+            attempt += 1
+            init_params = np.array([
+                np.random.uniform(-10, 10),       # x
+                np.random.uniform(0, 8),          # y
+                np.random.uniform(-10, 10),       # z
+                np.random.uniform(-np.pi, np.pi), # rx
+                np.random.uniform(-np.pi, np.pi), # ry
+                np.random.uniform(-np.pi, np.pi)  # rz
+            ])
+            obj_val = objective_function(init_params, mask, dt, corners)
+            
+            print(f"Attempt {attempt}: obj = {obj_val:.2f}")
+            if obj_val < 30:
+                found_initial = True
+                print(f"Found initial parameters for {color} cube on attempt {attempt} with objective {obj_val:.2f}:")
+                print(init_params)
+        
+        if not found_initial:
+            print(f"Could not find an initial pose for the {color} cube with sufficient overlap. Skipping.")
+            continue
+        
+        # Optimize the pose for this color
+        bounds = [
+            (-10, 10),    # x
+            (0, 10),      # y
+            (-10, 10),    # z
+            (-np.pi, np.pi),  # rx
+            (-np.pi, np.pi),  # ry
+            (-np.pi, np.pi)   # rz
+        ]
+        
+        result = differential_evolution(
+            objective_function,
+            bounds,
+            args=(mask, dt, corners),
+            strategy='best1bin',
+            maxiter=3000,
+            popsize=50,
+            mutation=(0.5, 1.0),
+            recombination=0.7,
+            tol=1e-5,
+            atol=1e-5,
+            disp=True,
+            workers=-1  # Use all available CPU cores
+        )
+
+        optimized_params = result.x
+        best_loss = result.fun
+        print(f"\nOptimized parameters for {color} cube:", optimized_params)
+        print(f"Final loss for {color} cube: {best_loss:.2f}")
+        
+        # Draw the optimized cube on the final image
+        optimized_projection = project_cube(optimized_params)
+        for start, end in edges:
+            pt1 = tuple(map(int, optimized_projection[start]))
+            pt2 = tuple(map(int, optimized_projection[end]))
+            cv2.line(final_img, pt1, pt2, color_bgr[color], 2)
+    
+    # Show final image with all cubes
+    cv2.imshow("Final Cube Fits", final_img)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()

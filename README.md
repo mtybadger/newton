@@ -16,3 +16,7 @@ After that, `physics.py` and `object_permanence.py` contain the two current task
 ### Pose Estimation
 
 Part of evaluating a model on the benchmark is pose estimation of 3D objects. For now, this is done with CV2 methods, but eventually we'll need to upgrade to a fully neural backbone such as FoundationPose or YOLOv11. You can try it at `predict.py`.
+
+### Pretrained models
+
+As soon as the model gets really good I'll put it here.
